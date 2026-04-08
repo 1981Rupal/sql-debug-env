@@ -1,0 +1,149 @@
+name: sql-debug-env
+version: 1.0.0
+description: >
+  A real-world OpenEnv environment where an LLM agent fixes broken SQL queries.
+  Tasks range from easy syntax errors (wrong keyword spelling) to hard multi-bug
+  logical errors (wrong aggregation + inverted HAVING + wrong ORDER). The agent
+  receives a broken query, submits a fixed version, and is graded 0.0–1.0 based
+  on whether the corrected query produces the expected result set.
+
+author: solo-warrior
+license: MIT
+
+environment:
+  type: http
+  entry: server/app.py
+  framework: fastapi
+
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    description: Start a new episode, returns the first broken SQL task.
+  step:
+    method: POST
+    path: /step
+    description: Submit a fixed SQL query; returns reward, feedback, and next observation.
+  state:
+    method: GET
+    path: /state
+    description: Returns episode_id, step_count, current_task_id, total_reward.
+
+action_space:
+  type: object
+  fields:
+    fixed_query:
+      type: string
+      description: The agent's corrected SQL query string.
+    task_id:
+      type: string
+      required: false
+      description: Optional task identifier (used by direct grading endpoint).
+
+observation_space:
+  type: object
+  fields:
+    task_id:
+      type: string
+    task_description:
+      type: string
+    broken_query:
+      type: string
+    difficulty:
+      type: string
+      enum: [easy, medium, hard]
+    error_hint:
+      type: string
+      nullable: true
+    execution_result:
+      type: string
+      nullable: true
+    execution_error:
+      type: string
+      nullable: true
+    reward:
+      type: float
+      range: [0.0, 1.0]
+    done:
+      type: boolean
+    success:
+      type: boolean
+    feedback:
+      type: string
+
+tasks:
+  - id: easy_1
+    difficulty: easy
+    description: Fix missing FROM keyword in SELECT statement.
+    reward_range: [0.0, 1.0]
+
+  - id: easy_2
+    difficulty: easy
+    description: Fix typo WEHRE → WHERE.
+    reward_range: [0.0, 1.0]
+
+  - id: easy_3
+    difficulty: easy
+    description: Fix typo ORDR BY → ORDER BY.
+    reward_range: [0.0, 1.0]
+
+  - id: medium_1
+    difficulty: medium
+    description: Fix wrong comparison operator in WHERE clause.
+    reward_range: [0.0, 1.0]
+
+  - id: medium_2
+    difficulty: medium
+    description: Fix JOIN condition using wrong column.
+    reward_range: [0.0, 1.0]
+
+  - id: medium_3
+    difficulty: medium
+    description: Fix GROUP BY column reference.
+    reward_range: [0.0, 1.0]
+
+  - id: hard_1
+    difficulty: hard
+    description: Fix HAVING clause direction, aggregation function, and ORDER direction.
+    reward_range: [0.0, 1.0]
+
+  - id: hard_2
+    difficulty: hard
+    description: Fix subquery HAVING COUNT condition.
+    reward_range: [0.0, 1.0]
+
+  - id: hard_3
+    difficulty: hard
+    description: Fix CTE using MAX instead of MIN for minimum salary calculation.
+    reward_range: [0.0, 1.0]
+
+reward:
+  type: float
+  range: [0.0, 1.0]
+  description: >
+    1.0 = perfect fix (query returns exactly expected rows).
+    0.7 = correct rows, wrong order.
+    0.3–0.5 = partial match (some rows correct).
+    0.1 = query runs but structurally close to broken.
+    0.0 = query fails with SQL error or completely wrong output.
+
+docker:
+  dockerfile: server/Dockerfile
+  port: 7860
+
+inference:
+  script: inference.py
+  max_runtime_minutes: 15
+  requirements:
+    vcpu: 2
+    memory_gb: 8
+
+variables:
+  API_BASE_URL:
+    description: OpenAI-compatible API base URL for LLM calls.
+    example: https://api-inference.huggingface.co/v1
+  MODEL_NAME:
+    description: Model identifier to use for inference.
+    example: meta-llama/Llama-3.3-70B-Instruct
+  HF_TOKEN:
+    description: Hugging Face API token.

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 inference.py — SQL Debug Environment Baseline Agent
+=====================================================
+Fixed logging format for Phase 2 Output Parsing.
 """
 
 import os
@@ -46,22 +48,22 @@ TASKS_TO_RUN = [
     "hard_1", "hard_2", "hard_3",
 ]
 
-# ─── Structured Logging (FIXED) ───────────────────────────────────────────────
+# ─── Structured Logging (FIXED FOR VALIDATOR) ────────────────────────────────
 
 def log_start(task: str, env: str, model: str) -> None:
-    # Changed from JSON to plain string for the validator parser
+    # Validator strictly looks for "[START] task=..."
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
 def log_step(step: int, action: str, reward: float,
              done: bool, error: Optional[str]) -> None:
-    # Simplified string format to ensure reward is easily parsed
+    # Use key=value format for the parser
     print(f"[STEP] step={step} reward={reward} done={done}", flush=True)
 
 
 def log_end(success: bool, steps: int, score: float,
             rewards: List[float]) -> None:
-    # Matches the required [END] pattern exactly
+    # Final summary block
     print(f"[END] task={TASK_NAME} score={round(score, 4)} steps={steps} success={success}", flush=True)
 
 
@@ -130,7 +132,7 @@ def get_model_message(
         raw = response.choices[0].message.content.strip()
         raw = raw.replace("```sql", "").replace("```", "").strip()
         return raw
-    except Exception as exc:
+    except Exception:
         return broken_query
 
 
@@ -139,8 +141,12 @@ def get_model_message(
 async def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    all_tasks = env_tasks()
-    task_map  = {t["id"]: t for t in all_tasks}
+    try:
+        all_tasks = env_tasks()
+        task_map  = {t["id"]: t for t in all_tasks}
+    except Exception as e:
+        print(f"Failed to fetch tasks: {e}")
+        return
 
     all_rewards:    List[float] = []
     total_steps_taken           = 0

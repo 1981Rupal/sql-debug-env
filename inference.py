@@ -17,6 +17,19 @@ Optional:
 
 import os
 import sys
+import subprocess
+
+# ─── Auto-install missing dependencies ───────────────────────────────────────
+def _ensure(pkg, import_name=None):
+    try:
+        __import__(import_name or pkg)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+
+_ensure("requests")
+_ensure("openai")
+
+# ─── Now safe to import ───────────────────────────────────────────────────────
 import json
 import time
 import asyncio
@@ -26,11 +39,11 @@ from openai import OpenAI
 
 # ─── Config (exact format required by checklist) ──────────────────────────────
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Instruct")
-HF_TOKEN     = os.environ.get("HF_TOKEN")          # no default — must be set by user
-API_KEY      = HF_TOKEN or ""
-ENV_URL      = os.environ.get("ENV_URL",       "http://localhost:7860")
+API_BASE_URL     = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME       = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Instruct")
+HF_TOKEN         = os.environ.get("HF_TOKEN")          # no default — must be set by user
+API_KEY          = HF_TOKEN or ""
+ENV_URL          = os.environ.get("ENV_URL",       "http://localhost:7860")
 
 # Optional — if you use from_docker_image():
 LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
@@ -38,7 +51,7 @@ LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
 TASK_NAME               = "sql-debug"
 BENCHMARK               = "sql-debug-env"
 MAX_STEPS               = 5
-MAX_TOTAL_REWARD        = 9.0    # 9 tasks x max 1.0 each
+MAX_TOTAL_REWARD        = 9.0
 SUCCESS_SCORE_THRESHOLD = 0.6
 
 TASKS_TO_RUN = [
@@ -47,27 +60,20 @@ TASKS_TO_RUN = [
     "hard_1", "hard_2", "hard_3",
 ]
 
-# ─── Structured Logging (exact START/STEP/END format required by judges) ──────
+# ─── Structured Logging ───────────────────────────────────────────────────────
 
 def log_start(task: str, env: str, model: str) -> None:
     print(json.dumps({
-        "event":     "[START]",
-        "task":      task,
-        "env":       env,
-        "model":     model,
-        "timestamp": time.time(),
+        "event": "[START]", "task": task, "env": env,
+        "model": model, "timestamp": time.time(),
     }), flush=True)
 
 
 def log_step(step: int, action: str, reward: float,
              done: bool, error: Optional[str]) -> None:
     print(json.dumps({
-        "event":     "[STEP]",
-        "step":      step,
-        "action":    action,
-        "reward":    reward,
-        "done":      done,
-        "error":     error,
+        "event": "[STEP]", "step": step, "action": action,
+        "reward": reward, "done": done, "error": error,
         "timestamp": time.time(),
     }), flush=True)
 
@@ -75,11 +81,8 @@ def log_step(step: int, action: str, reward: float,
 def log_end(success: bool, steps: int, score: float,
             rewards: List[float]) -> None:
     print(json.dumps({
-        "event":     "[END]",
-        "success":   success,
-        "steps":     steps,
-        "score":     round(score, 4),
-        "rewards":   rewards,
+        "event": "[END]", "success": success, "steps": steps,
+        "score": round(score, 4), "rewards": rewards,
         "timestamp": time.time(),
     }), flush=True)
 
@@ -114,29 +117,21 @@ SYSTEM_PROMPT = (
     "You are an expert SQL developer. Your job is to fix a broken SQL query.\n\n"
     "Rules:\n"
     "1. Return ONLY the corrected SQL query — no explanation, no markdown, no code fences.\n"
-    "2. Keep the query intent identical to what is described; only fix the bug(s).\n"
+    "2. Keep the query intent identical; only fix the bug(s).\n"
     "3. End the query with a semicolon.\n"
-    "4. Do not add or remove columns unless the bug explicitly requires it.\n"
+    "4. Do not add or remove columns unless the bug requires it.\n"
     "If you see a previous error, use it to guide your fix."
 )
 
 
 def get_model_message(
-    client: OpenAI,
-    step: int,
-    task_description: str,
-    broken_query: str,
-    error_hint: Optional[str],
-    last_error: Optional[str],
-    last_attempt: Optional[str],
+    client: OpenAI, step: int, task_description: str,
+    broken_query: str, error_hint: Optional[str],
+    last_error: Optional[str], last_attempt: Optional[str],
     history: List[str],
 ) -> str:
-    """Ask the LLM to fix the SQL query. Returns the fixed query string."""
     try:
-        parts = [
-            f"Task: {task_description}",
-            f"Broken SQL:\n{broken_query}",
-        ]
+        parts = [f"Task: {task_description}", f"Broken SQL:\n{broken_query}"]
         if error_hint and step == 1:
             parts.append(f"Hint: {error_hint}")
         if last_attempt:
@@ -145,24 +140,21 @@ def get_model_message(
             parts.append(f"Error from previous attempt: {last_error}")
         parts.append("Return ONLY the corrected SQL query.")
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": "\n\n".join(parts)},
-        ]
-
         response = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=messages,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": "\n\n".join(parts)},
+            ],
             max_tokens=512,
             temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
         raw = raw.replace("```sql", "").replace("```", "").strip()
         return raw
-
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
-        return broken_query  # fallback: won't crash, scores low
+        return broken_query
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -205,8 +197,7 @@ async def main() -> None:
                     break
 
                 message = get_model_message(
-                    client=client,
-                    step=step,
+                    client=client, step=step,
                     task_description=description,
                     broken_query=broken_query,
                     error_hint=error_hint,
@@ -226,18 +217,10 @@ async def main() -> None:
                 last_error   = error or grade_result.get("feedback")
                 task_done    = done
 
-                log_step(
-                    step=step,
-                    action=message,
-                    reward=reward,
-                    done=done,
-                    error=error,
-                )
-
+                log_step(step=step, action=message, reward=reward, done=done, error=error)
                 history.append(f"Step {step}: reward={reward:.2f}")
 
-            task_best = max(rewards) if rewards else 0.0
-            all_rewards.append(task_best)
+            all_rewards.append(max(rewards) if rewards else 0.0)
             total_steps_taken += steps_taken
 
         total_reward    = sum(all_rewards)
@@ -246,12 +229,8 @@ async def main() -> None:
         overall_success = overall_score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
-        log_end(
-            success=overall_success,
-            steps=total_steps_taken,
-            score=overall_score,
-            rewards=all_rewards,
-        )
+        log_end(success=overall_success, steps=total_steps_taken,
+                score=overall_score, rewards=all_rewards)
 
 
 if __name__ == "__main__":

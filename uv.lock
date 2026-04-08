@@ -1,0 +1,25 @@
+version = 1
+requires-python = ">=3.10"
+
+[[package]]
+name = "sql-debug-env"
+version = "1.0.0"
+source = { editable = "." }
+dependencies = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+    { name = "pydantic" },
+    { name = "openai" },
+    { name = "requests" },
+    { name = "openenv-core" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.111.0" },
+    { name = "uvicorn", specifier = ">=0.29.0" },
+    { name = "pydantic", specifier = ">=2.7.1" },
+    { name = "openai", specifier = ">=1.0.0" },
+    { name = "requests", specifier = ">=2.31.0" },
+    { name = "openenv-core", specifier = ">=0.2.0" },
+]

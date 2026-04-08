@@ -12,7 +12,7 @@ ENV PATH="/home/user/.local/bin:$PATH"
 WORKDIR /app
 
 # Copy and install dependencies
-COPY --chown=user server/requirements.txt /app/requirements.txt
+COPY --chown=user requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
 # Copy server application

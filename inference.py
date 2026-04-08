@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
 inference.py — SQL Debug Environment Baseline Agent
+Emits structured JSON [START]/[STEP]/[END] logs to stdout.
+
+Required env vars:
+  API_BASE_URL, MODEL_NAME, HF_TOKEN, ENV_URL
 """
 
-import os
-import sys
-import subprocess
+import os, sys, subprocess
 
-# ─── Auto-install missing dependencies ───────────────────────────────────────
-def _ensure(pkg, import_name=None):
-    try:
-        __import__(import_name or pkg)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+def _ensure(pkg):
+    try: __import__(pkg)
+    except ImportError: subprocess.check_call([sys.executable,"-m","pip","install",pkg,"-q"])
 
 _ensure("requests")
 _ensure("openai")
 
-import json
-import time
-import asyncio
+import json, time, asyncio
 from typing import List, Optional
 import requests
 from openai import OpenAI
@@ -31,7 +28,6 @@ MODEL_NAME       = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Inst
 HF_TOKEN         = os.environ.get("HF_TOKEN")
 API_KEY          = HF_TOKEN or ""
 ENV_URL          = os.environ.get("ENV_URL",       "http://localhost:7860")
-
 LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
 
 TASK_NAME               = "sql-debug"
@@ -41,173 +37,121 @@ MAX_TOTAL_REWARD        = 9.0
 SUCCESS_SCORE_THRESHOLD = 0.6
 
 TASKS_TO_RUN = [
-    "easy_1", "easy_2", "easy_3",
-    "medium_1", "medium_2", "medium_3",
-    "hard_1", "hard_2", "hard_3",
+    "easy_1","easy_2","easy_3",
+    "medium_1","medium_2","medium_3",
+    "hard_1","hard_2","hard_3",
 ]
 
-# ─── Structured Logging (FIXED) ───────────────────────────────────────────────
+# ─── Logging — MUST be JSON, MUST use [START]/[STEP]/[END] ───────────────────
 
 def log_start(task: str, env: str, model: str) -> None:
-    # Changed from JSON to plain string for the validator parser
-    print(f"[START] task={task} env={env} model={model}", flush=True)
-
+    print(json.dumps({"event":"[START]","task":task,"env":env,
+                      "model":model,"timestamp":time.time()}), flush=True)
 
 def log_step(step: int, action: str, reward: float,
              done: bool, error: Optional[str]) -> None:
-    # Simplified string format to ensure reward is easily parsed
-    print(f"[STEP] step={step} reward={reward} done={done}", flush=True)
-
+    print(json.dumps({"event":"[STEP]","step":step,"action":action,
+                      "reward":reward,"done":done,"error":error,
+                      "timestamp":time.time()}), flush=True)
 
 def log_end(success: bool, steps: int, score: float,
             rewards: List[float]) -> None:
-    # Matches the required [END] pattern exactly
-    print(f"[END] task={TASK_NAME} score={round(score, 4)} steps={steps} success={success}", flush=True)
+    print(json.dumps({"event":"[END]","success":success,"steps":steps,
+                      "score":round(score,4),"rewards":rewards,
+                      "timestamp":time.time()}), flush=True)
 
-
-# ─── Environment HTTP Client ──────────────────────────────────────────────────
+# ─── Env Client ───────────────────────────────────────────────────────────────
 
 def env_reset() -> dict:
     r = requests.post(f"{ENV_URL}/reset", timeout=30)
-    r.raise_for_status()
-    return r.json()
+    r.raise_for_status(); return r.json()
 
-
-def env_grade(task_id: str, fixed_query: str) -> dict:
-    r = requests.post(
-        f"{ENV_URL}/grade/{task_id}",
-        json={"fixed_query": fixed_query},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
+def env_grade(task_id: str, query: str) -> dict:
+    r = requests.post(f"{ENV_URL}/grade/{task_id}",
+                      json={"fixed_query": query}, timeout=30)
+    r.raise_for_status(); return r.json()
 
 def env_tasks() -> List[dict]:
     r = requests.get(f"{ENV_URL}/tasks", timeout=30)
-    r.raise_for_status()
-    return r.json()
-
+    r.raise_for_status(); return r.json()
 
 # ─── LLM Agent ───────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are an expert SQL developer. Your job is to fix a broken SQL query.\n\n"
-    "Rules:\n"
-    "1. Return ONLY the corrected SQL query — no explanation, no markdown, no code fences.\n"
-    "2. Keep the query intent identical; only fix the bug(s).\n"
-    "3. End the query with a semicolon.\n"
-    "4. Do not add or remove columns unless the bug requires it.\n"
-    "If you see a previous error, use it to guide your fix."
+    "You are an expert SQL developer. Fix the broken SQL query.\n"
+    "Rules: 1. Return ONLY the corrected SQL — no markdown, no explanation.\n"
+    "2. Keep intent identical; only fix bugs. 3. End with semicolon."
 )
 
-
-def get_model_message(
-    client: OpenAI, step: int, task_description: str,
-    broken_query: str, error_hint: Optional[str],
-    last_error: Optional[str], last_attempt: Optional[str],
-    history: List[str],
-) -> str:
+def get_model_message(client, step, description, broken_query,
+                      error_hint, last_error, last_attempt, history):
     try:
-        parts = [f"Task: {task_description}", f"Broken SQL:\n{broken_query}"]
-        if error_hint and step == 1:
-            parts.append(f"Hint: {error_hint}")
-        if last_attempt:
-            parts.append(f"Your previous attempt:\n{last_attempt}")
-        if last_error:
-            parts.append(f"Error from previous attempt: {last_error}")
+        parts = [f"Task: {description}", f"Broken SQL:\n{broken_query}"]
+        if error_hint and step == 1: parts.append(f"Hint: {error_hint}")
+        if last_attempt: parts.append(f"Previous attempt:\n{last_attempt}")
+        if last_error:   parts.append(f"Error: {last_error}")
         parts.append("Return ONLY the corrected SQL query.")
-
         response = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": "\n\n".join(parts)},
-            ],
-            max_tokens=512,
-            temperature=0.1,
+            messages=[{"role":"system","content":SYSTEM_PROMPT},
+                      {"role":"user","content":"\n\n".join(parts)}],
+            max_tokens=512, temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
-        raw = raw.replace("```sql", "").replace("```", "").strip()
-        return raw
-    except Exception as exc:
+        return raw.replace("```sql","").replace("```","").strip()
+    except Exception as e:
+        print(f"[DEBUG] LLM error: {e}", flush=True)
         return broken_query
-
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
     all_tasks = env_tasks()
     task_map  = {t["id"]: t for t in all_tasks}
-
-    all_rewards:    List[float] = []
-    total_steps_taken           = 0
-    overall_score               = 0.0
-    overall_success             = False
+    all_rewards: List[float] = []
+    total_steps = 0
+    overall_score = 0.0
+    overall_success = False
 
     log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
 
     try:
         for task_id in TASKS_TO_RUN:
-            task_info = task_map.get(task_id)
-            if not task_info:
-                continue
-
-            description  = task_info.get("task_description") or task_info.get("description", "")
-            broken_query = task_info["broken_query"]
-            error_hint   = task_info.get("error_hint")
-
-            history:      List[str]   = []
-            rewards:      List[float] = []
-            steps_taken               = 0
-            task_done                 = False
-            last_attempt: Optional[str] = None
-            last_error:   Optional[str] = None
-
+            info = task_map.get(task_id)
+            if not info: continue
+            desc    = info.get("task_description") or info.get("description","")
+            broken  = info["broken_query"]
+            hint    = info.get("error_hint")
+            rewards: List[float] = []
+            steps_taken = 0
+            done = False
+            last_attempt = last_error = None
             env_reset()
 
             for step in range(1, MAX_STEPS + 1):
-                if task_done:
-                    break
-
-                message = get_model_message(
-                    client=client, step=step,
-                    task_description=description,
-                    broken_query=broken_query,
-                    error_hint=error_hint,
-                    last_error=last_error,
-                    last_attempt=last_attempt,
-                    history=history,
-                )
-
-                grade_result = env_grade(task_id, message)
-                reward       = grade_result.get("reward", 0.0)
-                done         = grade_result.get("success", False)
-                error        = grade_result.get("execution_error")
-
+                if done: break
+                msg = get_model_message(client, step, desc, broken,
+                                        hint, last_error, last_attempt, [])
+                result  = env_grade(task_id, msg)
+                reward  = result.get("reward", 0.01)
+                done    = result.get("success", False)
+                error   = result.get("execution_error")
                 rewards.append(reward)
                 steps_taken  = step
-                last_attempt = message
-                last_error   = error or grade_result.get("feedback")
-                task_done    = done
+                last_attempt = msg
+                last_error   = error or result.get("feedback")
+                log_step(step=step, action=msg, reward=reward, done=done, error=error)
 
-                log_step(step=step, action=message, reward=reward, done=done, error=error)
-                history.append(f"Step {step}: reward={reward:.2f}")
+            all_rewards.append(max(rewards) if rewards else 0.01)
+            total_steps += steps_taken
 
-            all_rewards.append(max(rewards) if rewards else 0.0)
-            total_steps_taken += steps_taken
-
-        total_reward    = sum(all_rewards)
-        overall_score   = total_reward / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
-        overall_score   = min(max(overall_score, 0.0), 1.0)
+        total = sum(all_rewards)
+        overall_score   = min(max(total / MAX_TOTAL_REWARD, 0.0), 1.0)
         overall_success = overall_score >= SUCCESS_SCORE_THRESHOLD
-
     finally:
-        log_end(success=overall_success, steps=total_steps_taken,
+        log_end(success=overall_success, steps=total_steps,
                 score=overall_score, rewards=all_rewards)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

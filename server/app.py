@@ -1,6 +1,7 @@
 """
 SQL Debug Environment — FastAPI Server
 Real-world OpenEnv environment where an AI agent fixes broken SQL queries.
+IMPORTANT: All reward scores are strictly in (0.01, 0.99) — never 0.0 or 1.0.
 """
 
 import uuid
@@ -11,6 +12,13 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
+
+
+# ─── Reward clamping — scores must be STRICTLY between 0 and 1 ───────────────
+
+def clamp(score: float) -> float:
+    """Ensure reward is strictly in (0.01, 0.99), never exactly 0.0 or 1.0."""
+    return round(min(max(score, 0.01), 0.99), 4)
 
 
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
@@ -76,7 +84,7 @@ TASKS = [
     },
     {
         "id": "medium_1", "difficulty": "medium",
-        "description": "Fix the logic error: The query should return employees with salary > 80000, but uses the wrong comparison operator.",
+        "description": "Fix the logic error: query should return employees with salary > 80000 but uses wrong comparison operator.",
         "broken_query": "SELECT name, salary FROM employees WHERE salary < 80000 ORDER BY salary DESC;",
         "correct_query": "SELECT name, salary FROM employees WHERE salary > 80000 ORDER BY salary DESC;",
         "error_hint": None,
@@ -106,7 +114,7 @@ TASKS = [
     },
     {
         "id": "hard_1", "difficulty": "hard",
-        "description": "Multiple bugs: (1) Should use AVG not SUM. (2) HAVING should filter avg salary > 80000 not < 80000. (3) ORDER BY should be DESC.",
+        "description": "Multiple bugs: use AVG not SUM, HAVING avg > 80000 not < 80000, ORDER BY DESC.",
         "broken_query": "SELECT department, SUM(salary) as avg_salary FROM employees GROUP BY department HAVING SUM(salary) < 80000 ORDER BY avg_salary ASC;",
         "correct_query": "SELECT department, AVG(salary) as avg_salary FROM employees GROUP BY department HAVING AVG(salary) > 80000 ORDER BY avg_salary DESC;",
         "error_hint": None,
@@ -116,7 +124,7 @@ TASKS = [
     },
     {
         "id": "hard_2", "difficulty": "hard",
-        "description": "Fix the subquery: should find customers with MORE than 2 orders, but HAVING COUNT(*) = 1 is wrong.",
+        "description": "Fix the subquery: find customers with MORE than 2 orders — HAVING COUNT(*) = 1 is wrong.",
         "broken_query": "SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders GROUP BY customer_id HAVING COUNT(*) = 1) ORDER BY name;",
         "correct_query": "SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders GROUP BY customer_id HAVING COUNT(*) > 2) ORDER BY name;",
         "error_hint": None,
@@ -126,7 +134,7 @@ TASKS = [
     },
     {
         "id": "hard_3", "difficulty": "hard",
-        "description": "Fix the CTE: uses MAX instead of MIN for minimum salary, and WHERE should find employees ABOVE the minimum salary.",
+        "description": "Fix the CTE: uses MAX instead of MIN for minimum salary. Find employees ABOVE the minimum.",
         "broken_query": "WITH dept_min AS (SELECT department, MAX(salary) as min_salary FROM employees GROUP BY department) SELECT e.name, e.department, e.salary FROM employees e JOIN dept_min d ON e.department = d.department WHERE e.salary > d.min_salary ORDER BY e.department, e.salary;",
         "correct_query": "WITH dept_min AS (SELECT department, MIN(salary) as min_salary FROM employees GROUP BY department) SELECT e.name, e.department, e.salary FROM employees e JOIN dept_min d ON e.department = d.department WHERE e.salary > d.min_salary ORDER BY e.department, e.salary;",
         "error_hint": None,
@@ -145,8 +153,7 @@ def run_query_on_schema(schema_sql: str, query: str):
     conn = sqlite3.connect(":memory:")
     try:
         conn.executescript(schema_sql)
-        cursor = conn.execute(query)
-        rows = cursor.fetchall()
+        rows = conn.execute(query).fetchall()
         conn.close()
         return rows, None
     except Exception as e:
@@ -163,20 +170,19 @@ def _is_numeric(v):
 
 
 def _is_structurally_close(broken: str, agent: str) -> bool:
-    def keywords(s):
+    def kw(s):
         return set(re.findall(r'\b[A-Z_]+\b', s.upper()))
-    bk, ak = keywords(broken), keywords(agent)
-    if not bk:
-        return False
-    return len(bk & ak) / len(bk) > 0.6
+    bk, ak = kw(broken), kw(agent)
+    return len(bk & ak) / max(len(bk), 1) > 0.6
 
 
 def grade_response(task: dict, agent_query: str):
+    """Grade agent query. Returns reward STRICTLY in (0.01, 0.99)."""
     rows, error = run_query_on_schema(task["schema"], agent_query)
 
     if error:
-        partial = 0.1 if _is_structurally_close(task["broken_query"], agent_query) else 0.0
-        return partial, f"SQL error: {error}", None, error
+        score = 0.15 if _is_structurally_close(task["broken_query"], agent_query) else 0.05
+        return clamp(score), f"SQL error: {error}", None, error
 
     exec_result = str(rows)
     expected = task["expected_rows"]
@@ -184,43 +190,42 @@ def grade_response(task: dict, agent_query: str):
 
     if grader == "exact_rows":
         if rows == expected:
-            return 1.0, "Perfect! Query returns exactly the expected rows.", exec_result, None
+            return clamp(0.95), "Excellent! Query returns the expected rows.", exec_result, None
         elif set(rows) == set(expected):
-            return 0.7, "Rows correct but wrong order.", exec_result, None
+            return clamp(0.75), "Rows correct but wrong order.", exec_result, None
         else:
             overlap = len(set(rows) & set(expected))
-            partial = round(0.3 * overlap / max(len(expected), 1), 2)
-            return partial, f"Partially correct. Got {len(rows)} rows, expected {len(expected)}.", exec_result, None
+            score = 0.25 + 0.3 * overlap / max(len(expected), 1)
+            return clamp(score), f"Partial: {overlap}/{len(expected)} rows correct.", exec_result, None
 
     elif grader == "exact_rows_unordered":
         if set(rows) == set(expected):
-            return 1.0, "Perfect! All expected rows returned.", exec_result, None
+            return clamp(0.95), "Excellent! All expected rows returned.", exec_result, None
         else:
             overlap = len(set(rows) & set(expected))
-            partial = round(0.5 * overlap / max(len(expected), 1), 2)
-            return partial, f"Partial match: {overlap}/{len(expected)} rows correct.", exec_result, None
+            score = 0.25 + 0.4 * overlap / max(len(expected), 1)
+            return clamp(score), f"Partial: {overlap}/{len(expected)} rows correct.", exec_result, None
 
     elif grader == "partial_numeric":
         if rows == expected:
-            return 1.0, "Perfect! Exact match.", exec_result, None
-        row_set = set(rows)
-        exp_set = set(expected)
+            return clamp(0.95), "Excellent! Exact match.", exec_result, None
+        row_set, exp_set = set(rows), set(expected)
         exact_overlap = len(row_set & exp_set)
         if exact_overlap == len(expected):
-            return 0.9, "All rows present, minor ordering issue.", exec_result, None
+            return clamp(0.88), "All rows present, minor ordering issue.", exec_result, None
         if exact_overlap > 0:
-            partial = round(0.4 + 0.5 * exact_overlap / len(expected), 2)
-            return partial, f"Partial: {exact_overlap}/{len(expected)} rows correct.", exec_result, None
+            score = 0.4 + 0.45 * exact_overlap / len(expected)
+            return clamp(score), f"Partial: {exact_overlap}/{len(expected)} rows match.", exec_result, None
         if rows and expected and len(rows[0]) == len(expected[0]):
             col_match = all(_is_numeric(rows[0][i]) == _is_numeric(expected[0][i]) for i in range(len(rows[0])))
             if col_match:
-                correct_keywords = task.get("correct_query", "").upper()
-                structural_ok = all(kw in agent_query.upper() for kw in ["WITH", "MIN", "JOIN"] if kw in correct_keywords)
-                score = 0.35 if structural_ok else 0.2
-                return score, f"Query ran correctly but wrong rows. Got {len(rows)} rows.", exec_result, None
-        return 0.15, "Query ran but results do not match expected.", exec_result, None
+                correct_kw = task.get("correct_query", "").upper()
+                structural_ok = all(kw in agent_query.upper() for kw in ["WITH", "MIN", "JOIN"] if kw in correct_kw)
+                score = 0.35 if structural_ok else 0.18
+                return clamp(score), f"Query ran but wrong rows ({len(rows)} returned).", exec_result, None
+        return clamp(0.12), "Query ran but results do not match.", exec_result, None
 
-    return 0.0, "Unknown grader.", exec_result, None
+    return clamp(0.05), "Unknown grader.", exec_result, None
 
 
 # ─── Episode State ────────────────────────────────────────────────────────────
@@ -247,27 +252,18 @@ def _do_reset():
     _current_task = _pick_next_task()
     task = _current_task
     return SQLObservation(
-        task_id=task["id"],
-        task_description=task["description"],
-        broken_query=task["broken_query"],
-        difficulty=task["difficulty"],
-        error_hint=task.get("error_hint"),
-        execution_result=None,
-        execution_error=None,
-        reward=0.0,
-        done=False,
-        success=False,
+        task_id=task["id"], task_description=task["description"],
+        broken_query=task["broken_query"], difficulty=task["difficulty"],
+        error_hint=task.get("error_hint"), execution_result=None,
+        execution_error=None, reward=0.05, done=False, success=False,
         feedback="Environment reset. Fix the broken SQL query.",
     )
 
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
-app = FastAPI(
-    title="SQL Debug Environment",
-    description="OpenEnv-compatible environment where an LLM agent fixes broken SQL queries.",
-    version="1.0.0",
-)
+app = FastAPI(title="SQL Debug Environment", version="1.0.0",
+              description="OpenEnv environment: LLM agent fixes broken SQL queries.")
 
 
 @app.get("/")
@@ -301,44 +297,28 @@ def step(action: SQLAction):
     task = _current_task
     reward, feedback, exec_result, exec_error = grade_response(task, action.fixed_query)
     _total_reward += reward
-    done = reward >= 1.0 or _step_count >= 5
+    done = reward >= 0.9 or _step_count >= 5
     return SQLObservation(
-        task_id=task["id"],
-        task_description=task["description"],
-        broken_query=task["broken_query"],
-        difficulty=task["difficulty"],
+        task_id=task["id"], task_description=task["description"],
+        broken_query=task["broken_query"], difficulty=task["difficulty"],
         error_hint=task.get("error_hint") if reward < 0.5 else None,
-        execution_result=exec_result,
-        execution_error=exec_error,
-        reward=reward,
-        done=done,
-        success=reward >= 1.0,
-        feedback=feedback,
+        execution_result=exec_result, execution_error=exec_error,
+        reward=reward, done=done, success=reward >= 0.9, feedback=feedback,
     )
 
 
 @app.get("/state")
 def state():
-    return EnvState(
-        episode_id=_episode_id,
-        step_count=_step_count,
-        current_task_id=_current_task["id"] if _current_task else None,
-        total_reward=_total_reward,
-    )
+    return EnvState(episode_id=_episode_id, step_count=_step_count,
+                    current_task_id=_current_task["id"] if _current_task else None,
+                    total_reward=_total_reward)
 
 
 @app.get("/tasks")
 def list_tasks():
-    return [
-        {
-            "id": t["id"],
-            "difficulty": t["difficulty"],
-            "description": t["description"],
-            "broken_query": t["broken_query"],
-            "error_hint": t.get("error_hint"),
-        }
-        for t in TASKS
-    ]
+    return [{"id": t["id"], "difficulty": t["difficulty"],
+             "description": t["description"], "broken_query": t["broken_query"],
+             "error_hint": t.get("error_hint")} for t in TASKS]
 
 
 @app.post("/grade/{task_id}")
@@ -347,18 +327,10 @@ def grade_task(task_id: str, action: SQLAction):
     if not task:
         return JSONResponse(status_code=404, content={"error": f"Task {task_id} not found."})
     reward, feedback, exec_result, exec_error = grade_response(task, action.fixed_query)
-    return {
-        "task_id": task_id,
-        "difficulty": task["difficulty"],
-        "reward": reward,
-        "feedback": feedback,
-        "execution_result": exec_result,
-        "execution_error": exec_error,
-        "success": reward >= 1.0,
-    }
+    return {"task_id": task_id, "difficulty": task["difficulty"], "reward": reward,
+            "feedback": feedback, "execution_result": exec_result,
+            "execution_error": exec_error, "success": reward >= 0.9}
 
-
-# ─── Entry Point (required by openenv validate) ───────────────────────────────
 
 def main():
     uvicorn.run(app, host="0.0.0.0", port=7860)

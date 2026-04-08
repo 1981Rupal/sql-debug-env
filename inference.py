@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 """
 inference.py — SQL Debug Environment Baseline Agent
-=====================================================
-Runs an LLM agent against all 9 SQL Debug tasks and emits
-structured [START] / [STEP] / [END] logs to stdout.
-
-Required environment variables:
-  API_BASE_URL     OpenAI-compatible API endpoint
-  MODEL_NAME       Model identifier
-  HF_TOKEN         Hugging Face API token (no default)
-  ENV_URL          Running environment URL (default: http://localhost:7860)
-
-Optional:
-  LOCAL_IMAGE_NAME  Docker image name if using from_docker_image()
 """
 
 import os
@@ -29,7 +17,6 @@ def _ensure(pkg, import_name=None):
 _ensure("requests")
 _ensure("openai")
 
-# ─── Now safe to import ───────────────────────────────────────────────────────
 import json
 import time
 import asyncio
@@ -37,15 +24,14 @@ from typing import List, Optional
 import requests
 from openai import OpenAI
 
-# ─── Config (exact format required by checklist) ──────────────────────────────
+# ─── Config ──────────────────────────────────────────────────────────────────
 
 API_BASE_URL     = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME       = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Instruct")
-HF_TOKEN         = os.environ.get("HF_TOKEN")          # no default — must be set by user
+HF_TOKEN         = os.environ.get("HF_TOKEN")
 API_KEY          = HF_TOKEN or ""
 ENV_URL          = os.environ.get("ENV_URL",       "http://localhost:7860")
 
-# Optional — if you use from_docker_image():
 LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
 
 TASK_NAME               = "sql-debug"
@@ -60,31 +46,23 @@ TASKS_TO_RUN = [
     "hard_1", "hard_2", "hard_3",
 ]
 
-# ─── Structured Logging ───────────────────────────────────────────────────────
+# ─── Structured Logging (FIXED) ───────────────────────────────────────────────
 
 def log_start(task: str, env: str, model: str) -> None:
-    print(json.dumps({
-        "event": "[START]", "task": task, "env": env,
-        "model": model, "timestamp": time.time(),
-    }), flush=True)
+    # Changed from JSON to plain string for the validator parser
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
 def log_step(step: int, action: str, reward: float,
              done: bool, error: Optional[str]) -> None:
-    print(json.dumps({
-        "event": "[STEP]", "step": step, "action": action,
-        "reward": reward, "done": done, "error": error,
-        "timestamp": time.time(),
-    }), flush=True)
+    # Simplified string format to ensure reward is easily parsed
+    print(f"[STEP] step={step} reward={reward} done={done}", flush=True)
 
 
 def log_end(success: bool, steps: int, score: float,
             rewards: List[float]) -> None:
-    print(json.dumps({
-        "event": "[END]", "success": success, "steps": steps,
-        "score": round(score, 4), "rewards": rewards,
-        "timestamp": time.time(),
-    }), flush=True)
+    # Matches the required [END] pattern exactly
+    print(f"[END] task={TASK_NAME} score={round(score, 4)} steps={steps} success={success}", flush=True)
 
 
 # ─── Environment HTTP Client ──────────────────────────────────────────────────
@@ -153,7 +131,6 @@ def get_model_message(
         raw = raw.replace("```sql", "").replace("```", "").strip()
         return raw
     except Exception as exc:
-        print(f"[DEBUG] Model request failed: {exc}", flush=True)
         return broken_query
 
 
@@ -176,7 +153,6 @@ async def main() -> None:
         for task_id in TASKS_TO_RUN:
             task_info = task_map.get(task_id)
             if not task_info:
-                print(f"[DEBUG] Task {task_id} not found, skipping.", flush=True)
                 continue
 
             description  = task_info.get("task_description") or task_info.get("description", "")

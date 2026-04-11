@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
 inference.py — SQL Debug Environment Baseline Agent
-
-
 """
 
 import os, sys, subprocess
 
-# Auto-install missing packages (judge's machine may not have them)
+# Auto-install missing packages
 def _ensure(pkg):
     try: __import__(pkg)
     except ImportError: subprocess.check_call([sys.executable,"-m","pip","install",pkg,"-q"])
@@ -21,20 +19,16 @@ import requests
 from openai import OpenAI
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-# CRITICAL: The judge injects API_BASE_URL and API_KEY into our environment.
-# We MUST read API_KEY (not HF_TOKEN) — that's what their proxy checks.
-# We also accept HF_TOKEN as fallback so it still works locally for us.
+# read API_KEY
+#  accept HF_TOKEN as fallback so it still works locally.
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Instruct")
 
-# Judge injects API_KEY — this is the variable they monitor for proxy traffic
 API_KEY      = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or ""
 
-# Where our environment is running (judge sets this to our HF Space URL)
 ENV_URL      = os.environ.get("ENV_URL", "http://localhost:7860")
 
-# Optional — for docker-based local runs
 LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
 
 TASK_NAME               = "sql-debug"
@@ -46,8 +40,8 @@ SUCCESS_SCORE_THRESHOLD = 0.5
 TASKS_TO_RUN = ["easy", "medium", "hard"]
 
 # ─── Logging — plain text [START]/[STEP]/[END] as required ───────────────────
-# WHY plain text? The judge's parser looks for lines starting with
-# [START], [STEP], [END] — not JSON. So we print exactly that format.
+
+# [START], [STEP], [END] 
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -64,8 +58,8 @@ def log_end(success: bool, steps: int, score: float,
     print(f"[END] task={TASK_NAME} score={score:.4f} steps={steps} success={str(success).lower()} rewards={rewards_str}", flush=True)
 
 # ─── Environment Client ───────────────────────────────────────────────────────
-# This talks to our FastAPI server running on HF Spaces.
-# Think of it as the "front desk" of our toy shop.
+# Connect to our FastAPI server running on HF Spaces.
+
 
 def env_reset(task_id: Optional[str] = None) -> dict:
     params = {"task_id": task_id} if task_id else {}
@@ -85,8 +79,8 @@ def env_tasks() -> List[dict]:
     return r.json()
 
 # ─── LLM Agent ────────────────────────────────────────────────────────────────
-# This is the "smart mechanic" that looks at a broken car and tries to fix it.
-# We use the OpenAI client pointed at whatever URL the judge gives us.
+
+# OpenAI client pointed at whatever URL given.
 
 SYSTEM_PROMPT = (
     "You are an expert SQL developer. Fix the broken SQL query.\n"
@@ -132,9 +126,7 @@ def get_fix(client: OpenAI, step: int, description: str,
 #   4. Log [START], [STEP]s, [END]
 
 async def main() -> None:
-    # Create OpenAI client using JUDGE-PROVIDED credentials
-    # base_url  = their LiteLLM proxy (so they can monitor calls)
-    # api_key   = their API_KEY (NOT our HF_TOKEN)
+   
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     print(f"[DEBUG] API_BASE_URL={API_BASE_URL}", flush=True)

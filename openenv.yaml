@@ -2,12 +2,10 @@ name: sql-debug-env
 version: 1.0.0
 description: >
   A real-world OpenEnv environment where an LLM agent fixes broken SQL queries.
-  Tasks range from easy syntax errors (wrong keyword spelling) to hard multi-bug
-  logical errors (wrong aggregation + inverted HAVING + wrong ORDER). The agent
-  receives a broken query, submits a fixed version, and is graded 0.0–1.0 based
-  on whether the corrected query produces the expected result set.
+  Tasks range from easy syntax errors to hard multi-bug logical errors.
+  The agent receives a broken query, submits a fix, and is graded 0.01–0.99.
 
-author: solo-warrior
+author: RupalSharma
 license: MIT
 
 environment:
@@ -19,26 +17,25 @@ endpoints:
   reset:
     method: POST
     path: /reset
-    description: Start a new episode, returns the first broken SQL task.
   step:
     method: POST
     path: /step
-    description: Submit a fixed SQL query; returns reward, feedback, and next observation.
   state:
     method: GET
     path: /state
-    description: Returns episode_id, step_count, current_task_id, total_reward.
+  tasks:
+    method: GET
+    path: /tasks
+  graders:
+    method: GET
+    path: /graders
 
 action_space:
   type: object
   fields:
     fixed_query:
       type: string
-      description: The agent's corrected SQL query string.
-    task_id:
-      type: string
-      required: false
-      description: Optional task identifier (used by direct grading endpoint).
+      description: The corrected SQL query.
 
 observation_space:
   type: object
@@ -52,18 +49,9 @@ observation_space:
     difficulty:
       type: string
       enum: [easy, medium, hard]
-    error_hint:
-      type: string
-      nullable: true
-    execution_result:
-      type: string
-      nullable: true
-    execution_error:
-      type: string
-      nullable: true
     reward:
       type: float
-      range: [0.0, 1.0]
+      range: [0.01, 0.99]
     done:
       type: boolean
     success:
@@ -75,75 +63,96 @@ tasks:
   - id: easy_1
     difficulty: easy
     description: Fix missing FROM keyword in SELECT statement.
-    reward_range: [0.0, 1.0]
+    grader: exact_rows
+    reward_min: 0.01
+    reward_max: 0.99
 
   - id: easy_2
     difficulty: easy
-    description: Fix typo WEHRE → WHERE.
-    reward_range: [0.0, 1.0]
+    description: Fix typo WEHRE to WHERE.
+    grader: exact_rows
+    reward_min: 0.01
+    reward_max: 0.99
 
   - id: easy_3
     difficulty: easy
-    description: Fix typo ORDR BY → ORDER BY.
-    reward_range: [0.0, 1.0]
+    description: Fix typo ORDR BY to ORDER BY.
+    grader: exact_rows
+    reward_min: 0.01
+    reward_max: 0.99
 
   - id: medium_1
     difficulty: medium
     description: Fix wrong comparison operator in WHERE clause.
-    reward_range: [0.0, 1.0]
+    grader: exact_rows
+    reward_min: 0.01
+    reward_max: 0.99
 
   - id: medium_2
     difficulty: medium
     description: Fix JOIN condition using wrong column.
-    reward_range: [0.0, 1.0]
+    grader: exact_rows_unordered
+    reward_min: 0.01
+    reward_max: 0.99
 
   - id: medium_3
     difficulty: medium
     description: Fix GROUP BY column reference.
-    reward_range: [0.0, 1.0]
+    grader: exact_rows_unordered
+    reward_min: 0.01
+    reward_max: 0.99
 
   - id: hard_1
     difficulty: hard
-    description: Fix HAVING clause direction, aggregation function, and ORDER direction.
-    reward_range: [0.0, 1.0]
+    description: Fix HAVING direction, aggregation function, and ORDER direction.
+    grader: partial_numeric
+    reward_min: 0.01
+    reward_max: 0.99
 
   - id: hard_2
     difficulty: hard
     description: Fix subquery HAVING COUNT condition.
-    reward_range: [0.0, 1.0]
+    grader: exact_rows
+    reward_min: 0.01
+    reward_max: 0.99
 
   - id: hard_3
     difficulty: hard
-    description: Fix CTE using MAX instead of MIN for minimum salary calculation.
-    reward_range: [0.0, 1.0]
+    description: Fix CTE using MAX instead of MIN for minimum salary.
+    grader: partial_numeric
+    reward_min: 0.01
+    reward_max: 0.99
 
 reward:
   type: float
-  range: [0.0, 1.0]
+  range: [0.01, 0.99]
   description: >
-    1.0 = perfect fix (query returns exactly expected rows).
-    0.7 = correct rows, wrong order.
-    0.3–0.5 = partial match (some rows correct).
-    0.1 = query runs but structurally close to broken.
-    0.0 = query fails with SQL error or completely wrong output.
+    0.95 = perfect fix. 0.75 = correct rows wrong order.
+    0.25-0.5 = partial match. 0.05-0.15 = query runs but wrong output.
+    All scores strictly between 0 and 1 (never exactly 0.0 or 1.0).
+
+graders:
+  - id: exact_rows
+    description: Query must return exactly the expected rows in order.
+  - id: exact_rows_unordered
+    description: Query must return exactly the expected rows in any order.
+  - id: partial_numeric
+    description: Partial credit for numeric proximity and structural correctness.
 
 docker:
-  dockerfile: server/Dockerfile
+  dockerfile: Dockerfile
   port: 7860
 
 inference:
   script: inference.py
   max_runtime_minutes: 15
-  requirements:
-    vcpu: 2
-    memory_gb: 8
 
 variables:
   API_BASE_URL:
-    description: OpenAI-compatible API base URL for LLM calls.
-    example: https://api-inference.huggingface.co/v1
+    description: OpenAI-compatible API base URL.
+    default: https://router.huggingface.co/v1
   MODEL_NAME:
-    description: Model identifier to use for inference.
-    example: meta-llama/Llama-3.3-70B-Instruct
+    description: Model identifier.
+    default: meta-llama/Llama-3.3-70B-Instruct
   HF_TOKEN:
-    description: Hugging Face API token.
+    description: Hugging Face API token (no default).

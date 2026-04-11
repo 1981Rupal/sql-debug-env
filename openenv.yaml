@@ -1,158 +1,89 @@
 name: sql-debug-env
-version: 1.0.0
+version: "1.0.0"
 description: >
-  A real-world OpenEnv environment where an LLM agent fixes broken SQL queries.
-  Tasks range from easy syntax errors to hard multi-bug logical errors.
-  The agent receives a broken query, submits a fix, and is graded 0.01–0.99.
+  Real-world SQL query debugging environment for AI agent training.
+  An agent is given a broken SQL query and must fix it to match
+  expected output against a SQLite database. Three tasks cover
+  the most common real-world SQL bug categories.
 
 author: RupalSharma
-license: MIT
-
-environment:
-  type: http
-  entry: server/app.py
-  framework: fastapi
-
-endpoints:
-  reset:
-    method: POST
-    path: /reset
-  step:
-    method: POST
-    path: /step
-  state:
-    method: GET
-    path: /state
-  tasks:
-    method: GET
-    path: /tasks
-  graders:
-    method: GET
-    path: /graders
-
-action_space:
-  type: object
-  fields:
-    fixed_query:
-      type: string
-      description: The corrected SQL query.
-
-observation_space:
-  type: object
-  fields:
-    task_id:
-      type: string
-    task_description:
-      type: string
-    broken_query:
-      type: string
-    difficulty:
-      type: string
-      enum: [easy, medium, hard]
-    reward:
-      type: float
-      range: [0.01, 0.99]
-    done:
-      type: boolean
-    success:
-      type: boolean
-    feedback:
-      type: string
+tags:
+  - openenv
+  - sql
+  - developer-tools
+  - code-repair
+  - real-world
 
 tasks:
-  - id: easy_1
+  - id: easy
+    description: "Fix SQL syntax errors — misspelled keywords like WEHRE, ORDR BY, or missing FROM"
     difficulty: easy
-    description: Fix missing FROM keyword in SELECT statement.
-    grader: exact_rows
-    reward_min: 0.01
-    reward_max: 0.99
+    max_attempts: 5
+    scoring: "0.01–0.99 partial credit"
 
-  - id: easy_2
-    difficulty: easy
-    description: Fix typo WEHRE to WHERE.
-    grader: exact_rows
-    reward_min: 0.01
-    reward_max: 0.99
-
-  - id: easy_3
-    difficulty: easy
-    description: Fix typo ORDR BY to ORDER BY.
-    grader: exact_rows
-    reward_min: 0.01
-    reward_max: 0.99
-
-  - id: medium_1
+  - id: medium
+    description: "Fix wrong JOIN column references or incorrect GROUP BY logic"
     difficulty: medium
-    description: Fix wrong comparison operator in WHERE clause.
-    grader: exact_rows
-    reward_min: 0.01
-    reward_max: 0.99
+    max_attempts: 5
+    scoring: "0.01–0.99 partial credit"
 
-  - id: medium_2
-    difficulty: medium
-    description: Fix JOIN condition using wrong column.
-    grader: exact_rows_unordered
-    reward_min: 0.01
-    reward_max: 0.99
-
-  - id: medium_3
-    difficulty: medium
-    description: Fix GROUP BY column reference.
-    grader: exact_rows_unordered
-    reward_min: 0.01
-    reward_max: 0.99
-
-  - id: hard_1
+  - id: hard
+    description: "Fix wrong aggregation logic — SUM vs AVG, WHERE vs HAVING, wrong ORDER direction"
     difficulty: hard
-    description: Fix HAVING direction, aggregation function, and ORDER direction.
-    grader: partial_numeric
-    reward_min: 0.01
-    reward_max: 0.99
+    max_attempts: 5
+    scoring: "0.01–0.99 partial credit"
 
-  - id: hard_2
-    difficulty: hard
-    description: Fix subquery HAVING COUNT condition.
-    grader: exact_rows
-    reward_min: 0.01
-    reward_max: 0.99
+observation_space:
+  task_id: "string — easy | medium | hard"
+  task_description: "string — what the query should do"
+  broken_query: "string — the broken SQL query to fix"
+  difficulty: "string — easy | medium | hard"
+  error_hint: "string — hint for easy tasks"
+  execution_result: "string — result of agent's query"
+  execution_error: "string — SQL error if query failed"
+  reward: "float — score strictly between 0.01 and 0.99"
+  done: "bool — episode complete"
+  success: "bool — task solved"
+  feedback: "string — grader feedback"
 
-  - id: hard_3
-    difficulty: hard
-    description: Fix CTE using MAX instead of MIN for minimum salary.
-    grader: partial_numeric
-    reward_min: 0.01
-    reward_max: 0.99
+action_space:
+  fixed_query: "string (required) — your corrected SQL query"
 
 reward:
-  type: float
+  type: continuous
   range: [0.01, 0.99]
-  description: >
-    0.95 = perfect fix. 0.75 = correct rows wrong order.
-    0.25-0.5 = partial match. 0.05-0.15 = query runs but wrong output.
-    All scores strictly between 0 and 1 (never exactly 0.0 or 1.0).
+  shaping:
+    - "0.95 — query returns exactly the expected rows"
+    - "0.75 — correct rows but wrong order"
+    - "0.20-0.50 — partial row match"
+    - "0.15 — query runs, structurally close to correct"
+    - "0.05 — query fails with SQL error"
 
-graders:
-  - id: exact_rows
-    description: Query must return exactly the expected rows in order.
-  - id: exact_rows_unordered
-    description: Query must return exactly the expected rows in any order.
-  - id: partial_numeric
-    description: Partial credit for numeric proximity and structural correctness.
+endpoints:
+  - path: /reset
+    method: POST
+    description: Start a new episode
+  - path: /step
+    method: POST
+    description: Submit a fixed SQL query
+  - path: /state
+    method: GET
+    description: Get current episode metadata
+  - path: /tasks
+    method: GET
+    description: List all 3 tasks with grader info
+  - path: /grader
+    method: POST
+    description: Grade a query without running a full episode
+  - path: /baseline
+    method: GET
+    description: Run oracle baseline — returns scores for all 3 tasks
+  - path: /health
+    method: GET
+    description: Health check
 
-docker:
-  dockerfile: Dockerfile
-  port: 7860
-
-inference:
-  script: inference.py
-  max_runtime_minutes: 15
-
-variables:
-  API_BASE_URL:
-    description: OpenAI-compatible API base URL.
-    default: https://router.huggingface.co/v1
-  MODEL_NAME:
-    description: Model identifier.
-    default: meta-llama/Llama-3.3-70B-Instruct
-  HF_TOKEN:
-    description: Hugging Face API token (no default).
+runtime:
+  framework: FastAPI
+  python: "3.11"
+  docker: true
+  hf_spaces: true

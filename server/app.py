@@ -316,9 +316,29 @@ def state():
 
 @app.get("/tasks")
 def list_tasks():
-    return [{"id": t["id"], "difficulty": t["difficulty"],
-             "description": t["description"], "broken_query": t["broken_query"],
-             "error_hint": t.get("error_hint")} for t in TASKS]
+    return [{
+        "id": t["id"],
+        "difficulty": t["difficulty"],
+        "description": t["description"],
+        "broken_query": t["broken_query"],
+        "error_hint": t.get("error_hint"),
+        "grader": t["grader"],
+        "has_grader": True,
+        "reward_range": [0.01, 0.99],
+    } for t in TASKS]
+
+
+@app.get("/graders")
+def list_graders():
+    """List all task graders — required by OpenEnv validator."""
+    return [{
+        "task_id": t["id"],
+        "difficulty": t["difficulty"],
+        "grader_type": t["grader"],
+        "reward_min": 0.01,
+        "reward_max": 0.99,
+        "description": t["description"],
+    } for t in TASKS]
 
 
 @app.post("/grade/{task_id}")

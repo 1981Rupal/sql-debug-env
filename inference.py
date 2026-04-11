@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 inference.py — SQL Debug Environment Baseline Agent
-Emits [START]/[STEP]/[END] structured stdout logs as required by the validator.
 
-Required env vars:
-  API_BASE_URL, MODEL_NAME, HF_TOKEN, ENV_URL
+
 """
 
 import os, sys, subprocess
 
+# Auto-install missing packages (judge's machine may not have them)
 def _ensure(pkg):
     try: __import__(pkg)
     except ImportError: subprocess.check_call([sys.executable,"-m","pip","install",pkg,"-q"])
@@ -22,131 +21,195 @@ import requests
 from openai import OpenAI
 
 # ─── Config ───────────────────────────────────────────────────────────────────
+# CRITICAL: The judge injects API_BASE_URL and API_KEY into our environment.
+# We MUST read API_KEY (not HF_TOKEN) — that's what their proxy checks.
+# We also accept HF_TOKEN as fallback so it still works locally for us.
 
-API_BASE_URL     = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME       = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Instruct")
-HF_TOKEN         = os.environ.get("HF_TOKEN")
-API_KEY          = HF_TOKEN or ""
-ENV_URL          = os.environ.get("ENV_URL",       "http://localhost:7860")
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Instruct")
+
+# Judge injects API_KEY — this is the variable they monitor for proxy traffic
+API_KEY      = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or ""
+
+# Where our environment is running (judge sets this to our HF Space URL)
+ENV_URL      = os.environ.get("ENV_URL", "http://localhost:7860")
+
+# Optional — for docker-based local runs
 LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
 
 TASK_NAME               = "sql-debug"
 BENCHMARK               = "sql-debug-env"
 MAX_STEPS               = 5
-MAX_TOTAL_REWARD        = 9.0
-SUCCESS_SCORE_THRESHOLD = 0.6
+MAX_TOTAL_REWARD        = 3.0   # 3 tasks × max ~1.0 each
+SUCCESS_SCORE_THRESHOLD = 0.5
 
-TASKS_TO_RUN = [
-    "easy_1","easy_2","easy_3",
-    "medium_1","medium_2","medium_3",
-    "hard_1","hard_2","hard_3",
-]
+TASKS_TO_RUN = ["easy", "medium", "hard"]
 
-# ─── Structured Logging — plain text format as required by validator ──────────
+# ─── Logging — plain text [START]/[STEP]/[END] as required ───────────────────
+# WHY plain text? The judge's parser looks for lines starting with
+# [START], [STEP], [END] — not JSON. So we print exactly that format.
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 def log_step(step: int, action: str, reward: float,
              done: bool, error: Optional[str]) -> None:
-    print(f"[STEP] step={step} reward={reward} done={done} action={action[:80]}", flush=True)
+    action_clean = action.replace("\n", " ")[:80]
+    error_val    = error if error else "null"
+    print(f"[STEP] step={step} reward={reward:.4f} done={str(done).lower()} action={action_clean!r} error={error_val}", flush=True)
 
 def log_end(success: bool, steps: int, score: float,
             rewards: List[float]) -> None:
-    print(f"[END] task={TASK_NAME} score={round(score,4)} steps={steps} success={success}", flush=True)
+    rewards_str = ",".join(f"{r:.4f}" for r in rewards)
+    print(f"[END] task={TASK_NAME} score={score:.4f} steps={steps} success={str(success).lower()} rewards={rewards_str}", flush=True)
 
-# ─── Env Client ───────────────────────────────────────────────────────────────
+# ─── Environment Client ───────────────────────────────────────────────────────
+# This talks to our FastAPI server running on HF Spaces.
+# Think of it as the "front desk" of our toy shop.
 
-def env_reset() -> dict:
-    r = requests.post(f"{ENV_URL}/reset", timeout=30)
-    r.raise_for_status(); return r.json()
+def env_reset(task_id: Optional[str] = None) -> dict:
+    params = {"task_id": task_id} if task_id else {}
+    r = requests.post(f"{ENV_URL}/reset", params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 def env_grade(task_id: str, query: str) -> dict:
-    r = requests.post(f"{ENV_URL}/grade/{task_id}",
+    r = requests.post(f"{ENV_URL}/grader/{task_id}",
                       json={"fixed_query": query}, timeout=30)
-    r.raise_for_status(); return r.json()
+    r.raise_for_status()
+    return r.json()
 
 def env_tasks() -> List[dict]:
     r = requests.get(f"{ENV_URL}/tasks", timeout=30)
-    r.raise_for_status(); return r.json()
+    r.raise_for_status()
+    return r.json()
 
 # ─── LLM Agent ────────────────────────────────────────────────────────────────
+# This is the "smart mechanic" that looks at a broken car and tries to fix it.
+# We use the OpenAI client pointed at whatever URL the judge gives us.
 
 SYSTEM_PROMPT = (
     "You are an expert SQL developer. Fix the broken SQL query.\n"
-    "Rules: 1. Return ONLY the corrected SQL — no markdown, no explanation.\n"
-    "2. Keep intent identical; only fix bugs. 3. End with semicolon."
+    "Rules:\n"
+    "1. Return ONLY the corrected SQL — no markdown, no explanation, no code fences.\n"
+    "2. Keep the intent identical — only fix the bugs.\n"
+    "3. End with a semicolon."
 )
 
-def get_model_message(client, step, description, broken_query,
-                      error_hint, last_error, last_attempt):
+def get_fix(client: OpenAI, step: int, description: str,
+            broken_query: str, error_hint: Optional[str],
+            last_error: Optional[str], last_attempt: Optional[str]) -> str:
     try:
         parts = [f"Task: {description}", f"Broken SQL:\n{broken_query}"]
-        if error_hint and step == 1: parts.append(f"Hint: {error_hint}")
-        if last_attempt: parts.append(f"Previous attempt:\n{last_attempt}")
-        if last_error:   parts.append(f"Error: {last_error}")
+        if error_hint and step == 1:
+            parts.append(f"Hint: {error_hint}")
+        if last_attempt:
+            parts.append(f"Your previous attempt:\n{last_attempt}")
+        if last_error:
+            parts.append(f"Error from previous attempt: {last_error}")
         parts.append("Return ONLY the corrected SQL query.")
-        response = client.chat.completions.create(
+
+        resp = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[{"role":"system","content":SYSTEM_PROMPT},
-                      {"role":"user","content":"\n\n".join(parts)}],
-            max_tokens=512, temperature=0.1,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": "\n\n".join(parts)},
+            ],
+            max_tokens=512,
+            temperature=0.1,
         )
-        raw = response.choices[0].message.content.strip()
-        return raw.replace("```sql","").replace("```","").strip()
+        raw = resp.choices[0].message.content.strip()
+        return raw.replace("```sql", "").replace("```", "").strip()
     except Exception as e:
         print(f"[DEBUG] LLM error: {e}", flush=True)
-        return broken_query
+        return broken_query   # fallback — won't crash, scores low
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ─── Main Loop ────────────────────────────────────────────────────────────────
+# For each task (easy/medium/hard):
+#   1. Reset the environment to get the broken query
+#   2. Ask LLM to fix it (up to MAX_STEPS tries)
+#   3. Grade each attempt
+#   4. Log [START], [STEP]s, [END]
 
 async def main() -> None:
+    # Create OpenAI client using JUDGE-PROVIDED credentials
+    # base_url  = their LiteLLM proxy (so they can monitor calls)
+    # api_key   = their API_KEY (NOT our HF_TOKEN)
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+    print(f"[DEBUG] API_BASE_URL={API_BASE_URL}", flush=True)
+    print(f"[DEBUG] MODEL_NAME={MODEL_NAME}", flush=True)
+    print(f"[DEBUG] ENV_URL={ENV_URL}", flush=True)
+    print(f"[DEBUG] API_KEY present={bool(API_KEY)}", flush=True)
+
+    # Fetch task info from our environment
     all_tasks = env_tasks()
     task_map  = {t["id"]: t for t in all_tasks}
-    all_rewards: List[float] = []
-    total_steps = 0
-    overall_score = 0.0
-    overall_success = False
 
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    all_rewards:    List[float] = []
+    total_steps                 = 0
+    overall_success             = False
 
-    try:
-        for task_id in TASKS_TO_RUN:
-            info = task_map.get(task_id)
-            if not info: continue
-            desc   = info.get("task_description") or info.get("description","")
-            broken = info["broken_query"]
-            hint   = info.get("error_hint")
-            rewards: List[float] = []
-            steps_taken = 0
-            done = False
-            last_attempt = last_error = None
-            env_reset()
+    for task_id in TASKS_TO_RUN:
+        info = task_map.get(task_id)
+        if not info:
+            print(f"[DEBUG] Task '{task_id}' not found, skipping.", flush=True)
+            continue
+
+        desc    = info.get("task_description") or info.get("description", "")
+        broken  = info["broken_query"]
+        hint    = info.get("error_hint")
+
+        rewards: List[float] = []
+        steps_taken           = 0
+        task_done             = False
+        last_attempt          = None
+        last_error            = None
+
+        log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+
+        try:
+            env_reset(task_id=task_id)
 
             for step in range(1, MAX_STEPS + 1):
-                if done: break
-                msg    = get_model_message(client, step, desc, broken,
-                                           hint, last_error, last_attempt)
-                result = env_grade(task_id, msg)
-                reward = result.get("reward", 0.01)
-                done   = result.get("success", False)
-                error  = result.get("execution_error")
+                if task_done:
+                    break
+
+                fixed = get_fix(client, step, desc, broken,
+                                hint, last_error, last_attempt)
+
+                result     = env_grade(task_id, fixed)
+                reward     = float(result.get("reward", 0.01))
+                done       = bool(result.get("success", False))
+                exec_error = result.get("execution_error")
+
                 rewards.append(reward)
                 steps_taken  = step
-                last_attempt = msg
-                last_error   = error or result.get("feedback")
-                log_step(step=step, action=msg, reward=reward, done=done, error=error)
+                last_attempt = fixed
+                last_error   = exec_error or result.get("feedback")
+                task_done    = done
 
-            all_rewards.append(max(rewards) if rewards else 0.01)
+                log_step(step=step, action=fixed, reward=reward,
+                         done=done, error=exec_error)
+
+        except Exception as e:
+            print(f"[DEBUG] Task {task_id} error: {e}", flush=True)
+
+        finally:
+            best   = max(rewards) if rewards else 0.01
+            best   = min(max(best, 0.01), 0.99)
+            s_ok   = best >= 0.9
+            log_end(success=s_ok, steps=steps_taken,
+                    score=best, rewards=rewards)
+            all_rewards.append(best)
             total_steps += steps_taken
 
-        total = sum(all_rewards)
-        overall_score   = min(max(total / MAX_TOTAL_REWARD, 0.0), 1.0)
-        overall_success = overall_score >= SUCCESS_SCORE_THRESHOLD
-    finally:
-        log_end(success=overall_success, steps=total_steps,
-                score=overall_score, rewards=all_rewards)
+    # Overall summary
+    overall_score   = sum(all_rewards) / MAX_TOTAL_REWARD if all_rewards else 0.0
+    overall_score   = min(max(overall_score, 0.0), 1.0)
+    overall_success = overall_score >= SUCCESS_SCORE_THRESHOLD
+    print(f"[SUMMARY] total_score={overall_score:.4f} success={overall_success} tasks={len(all_rewards)}", flush=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
